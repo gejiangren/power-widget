@@ -43,7 +43,7 @@ A floating macOS desktop widget showing real-time SoC power, battery flow, therm
 
 ## 系统要求 | Requirements
 
-- **Apple Silicon Mac**(M1 / M2 / M3 / M4)
+- **Apple Silicon Mac**(M1 / M2 / M3 / M4 / M5 系列)
 - **macOS 11**(Big Sur)或更新版本
 - 不支持 Intel Mac
 
