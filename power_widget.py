@@ -88,7 +88,7 @@ def read_soc_power():
     try:
         with open(f, 'rb') as fh:
             try:
-                fh.seek(-300_000, 2)
+                fh.seek(-30_000, 2)  # 只读末 30KB:够 10 个 sample,IO 砍 10×
             except OSError:
                 fh.seek(0)
             text = fh.read().decode('utf-8', errors='ignore')
@@ -245,7 +245,7 @@ def read_thermal_pressure():
                 continue
             with open(f, 'rb') as fh:
                 try:
-                    fh.seek(-300_000, 2)
+                    fh.seek(-30_000, 2)  # 只读末 30KB
                 except OSError:
                     fh.seek(0)
                 text = fh.read().decode('utf-8', errors='replace')
@@ -446,6 +446,7 @@ class Controller(NSObject):
         bg.layer().setMasksToBounds_(True)
         self.window.setContentView_(bg)
         self.window.invalidateShadow()
+        self.bgView = bg  # 留引用给 occlusion handler 控制可见性
 
         capFont = NSFont.systemFontOfSize_weight_(9, 0.3)
         capColor = NSColor.tertiaryLabelColor()
@@ -487,9 +488,80 @@ class Controller(NSObject):
         self.window.makeKeyAndOrderFront_(None)
 
         self._reading = False
-        self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            1.0, self, "tick:", None, True
-        )
+        self._cachedSmall = ''         # 电池流向缓存(10s 一刷)
+        self._cachedBattPct = 0.0
+        self._cachedThermCn = ''       # 散热压力缓存
+        self._cachedThermSev = 0
+        self._startTimer()
+
+        # 屏幕熄屏(盒盖)时暂停 tick,亮屏时恢复 — 不消耗 CPU
+        nc = NSWorkspace.sharedWorkspace().notificationCenter()
+        nc.addObserver_selector_name_object_(
+            self, "screensSleep:", "NSWorkspaceScreensDidSleepNotification", None)
+        nc.addObserver_selector_name_object_(
+            self, "screensWake:", "NSWorkspaceScreensDidWakeNotification", None)
+        nc.addObserver_selector_name_object_(
+            self, "screensSleep:", "NSWorkspaceWillSleepNotification", None)
+        nc.addObserver_selector_name_object_(
+            self, "screensWake:", "NSWorkspaceDidWakeNotification", None)
+
+        # widget 被其他窗口完全盖住时进入深度休眠:停 timer + 隐藏磨砂背景(NSVisualEffectView 60Hz 采样停掉)
+        NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            self, "windowOcclusionChanged:",
+            'NSWindowDidChangeOcclusionStateNotification', self.window)
+
+    @objc.python_method
+    def _startTimer(self):
+        if getattr(self, 'timer', None) is None:
+            self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                2.0, self, "tick:", None, True
+            )
+
+    def screensSleep_(self, note):
+        if getattr(self, 'timer', None) is not None:
+            self.timer.invalidate()
+            self.timer = None
+        try:
+            with open('/tmp/powerwidget_sleep.log', 'a') as f:
+                f.write(f'[{time.strftime("%H:%M:%S")}] SLEEP - timer paused (note={note.name()})\n')
+        except Exception:
+            pass
+
+    def screensWake_(self, note):
+        self._startTimer()
+        try:
+            with open('/tmp/powerwidget_sleep.log', 'a') as f:
+                f.write(f'[{time.strftime("%H:%M:%S")}] WAKE - timer restarted (note={note.name()})\n')
+        except Exception:
+            pass
+
+    def windowOcclusionChanged_(self, note):
+        """widget 完全被其他窗口盖住时,完全停所有工作;露出来再恢复"""
+        try:
+            # NSWindowOcclusionStateVisible = 1 << 1 = 2
+            visible = bool(self.window.occlusionState() & 2)
+        except Exception:
+            visible = True  # 异常时保守:保持活跃
+        try:
+            with open('/tmp/powerwidget_sleep.log', 'a') as f:
+                f.write(f'[{time.strftime("%H:%M:%S")}] OCCLUSION {"VISIBLE" if visible else "HIDDEN"}\n')
+        except Exception:
+            pass
+        if visible:
+            # 露出来:恢复 timer + 磨砂,立刻刷一次
+            self._startTimer()
+            if hasattr(self, 'bgView'):
+                self.bgView.setHidden_(False)
+            if not getattr(self, '_reading', False):
+                self._reading = True
+                threading.Thread(target=self._bgRead, daemon=True).start()
+        else:
+            # 完全被盖:停 timer + 隐藏磨砂(NSVisualEffectView 不再采样桌面)
+            if getattr(self, 'timer', None) is not None:
+                self.timer.invalidate()
+                self.timer = None
+            if hasattr(self, 'bgView'):
+                self.bgView.setHidden_(True)
 
     @objc.python_method
     def _label(self, frame, text, font, color):
@@ -509,14 +581,13 @@ class Controller(NSObject):
         if not self._reading:
             self._reading = True
             threading.Thread(target=self._bgRead, daemon=True).start()
-        # 每 3 秒额外刷新一次 top apps(top 命令耗时 1.5s,频率不能太高)
+        # tick=2s,每 15 ticks(30s) 刷一次 top apps;top -l 2 -s 1 单次 1s CPU,频率压到最低
         self._tickCount = getattr(self, '_tickCount', 0) + 1
-        if self._tickCount % 3 == 1 and not getattr(self, '_readingTop', False):
+        if self._tickCount % 15 == 1 and not getattr(self, '_readingTop', False):
             self._readingTop = True
             threading.Thread(target=self._bgReadTop, daemon=True).start()
-        # 每 2 秒主动 orderFront,强制 WindowServer 重新派事件
-        # (短间隔避免"两次刷新之间偶尔掉线"现象)
-        if self._tickCount % 2 == 0:
+        # 每 15 ticks(30s) orderFront 一次,防 WindowServer 长闲置后停派事件
+        if self._tickCount % 15 == 0:
             try:
                 self.window.orderFront_(None)
             except Exception:
@@ -554,9 +625,22 @@ class Controller(NSObject):
     @objc.python_method
     def _bgRead(self):
         try:
+            # SoC 功耗每次都读(大字,2s 刷,用户最关注)
             soc = read_soc_power()
-            small, batt_pct = read_battery()
-            therm_cn, therm_sev = read_thermal_pressure()
+            # 电池流向 + 散热压力变化慢,每 5 ticks(10s)读一次,其余用缓存
+            tc = getattr(self, '_tickCount', 0)
+            if tc % 5 == 0 or not self._cachedSmall:
+                small, batt_pct = read_battery()
+                therm_cn, therm_sev = read_thermal_pressure()
+                self._cachedSmall = small
+                self._cachedBattPct = batt_pct
+                self._cachedThermCn = therm_cn
+                self._cachedThermSev = therm_sev
+            else:
+                small = self._cachedSmall
+                batt_pct = self._cachedBattPct
+                therm_cn = self._cachedThermCn
+                therm_sev = self._cachedThermSev
             if soc is None:
                 info = {'big': '等数据', 'small': '需要 asitop 在跑',
                         'pct': batt_pct, 'pctText': f'{int(batt_pct * 100)}%',

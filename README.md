@@ -10,7 +10,7 @@ A floating macOS desktop widget showing real-time SoC power, battery flow, therm
 
 ## 功能 | Features
 
-- **大字**:CPU+GPU 实时功耗(瓦特,1Hz 刷新)
+- **大字**:CPU+GPU 实时功耗(瓦特,2 秒刷新一次)
 - **圆环**:电池电量(跟 macOS 状态栏一致)
 - **小字**:电池流向 / 整机功耗 / 充电速率 / 满电状态
 - **顶部**:macOS 热压力等级(正常 / 微热 / 偏热 / 较热 / 严重发热)
@@ -43,7 +43,7 @@ A floating macOS desktop widget showing real-time SoC power, battery flow, therm
 
 ## 系统要求 | Requirements
 
-- **Apple Silicon Mac**(M1 / M2 / M3 / M4 / M5 系列)
+- **Apple Silicon Mac**(M1 / M2 / M3 / M4)
 - **macOS 11**(Big Sur)或更新版本
 - 不支持 Intel Mac
 
